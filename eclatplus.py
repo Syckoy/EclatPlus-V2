@@ -4,12 +4,37 @@ from __future__ import annotations
 import atexit
 import ctypes
 import json
+import os
 import sys
+import tempfile
+import threading
 import tkinter as tk
+import urllib.request
+import zipfile
 from ctypes import wintypes
 from pathlib import Path
+from tkinter import messagebox
 
 APP_NAME = "EclatPlus"
+LOCAL_VERSION = "1.2.0"
+GITHUB_PAGE = "https://github.com/Syckoy/EclatPlus-V2"
+GITHUB_VERSION_URLS = (
+    "https://raw.githubusercontent.com/Syckoy/EclatPlus-V2/main/version.json",
+    "https://raw.githubusercontent.com/Syckoy/EclatPlus-V2/master/version.json",
+)
+GITHUB_ZIP_URLS = (
+    "https://github.com/Syckoy/EclatPlus-V2/archive/refs/heads/main.zip",
+    "https://github.com/Syckoy/EclatPlus-V2/archive/refs/heads/master.zip",
+)
+UPDATE_FILES = (
+    "eclatplus.py",
+    "lancer.bat",
+    "build_exe.bat",
+    "README.md",
+    "version.json",
+    ".gitignore",
+)
+
 
 
 def settings_path() -> Path:
@@ -44,11 +69,11 @@ def save_settings(data: dict) -> None:
 
 def exe_command() -> str:
     if getattr(sys, "frozen", False):
-        path = sys.executable
-    else:
-        path = str(Path(__file__).resolve())
-        return f'"{sys.executable}" "{path}" --tray'
-    return f'"{path}" --tray'
+        return f'"{sys.executable}" --tray'
+    script = Path(__file__).resolve()
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    exe = str(pyw if pyw.exists() else sys.executable)
+    return f'"{exe}" "{script}" --tray'
 
 
 def set_startup(enabled: bool) -> None:
@@ -68,6 +93,88 @@ def set_startup(enabled: bool) -> None:
                 pass
     finally:
         key.Close()
+
+
+def _parse_version(text: str) -> tuple[int, ...]:
+    parts = []
+    for bit in str(text).strip().lstrip("vV").split("."):
+        if bit.isdigit():
+            parts.append(int(bit))
+        else:
+            break
+    return tuple(parts or (0,))
+
+
+def _http_get(url: str, timeout: float) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": f"EclatPlus/{LOCAL_VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def remote_version() -> str | None:
+    for url in GITHUB_VERSION_URLS:
+        try:
+            data = json.loads(_http_get(url, 8).decode("utf-8"))
+            ver = str(data.get("version") or "").strip()
+            if ver:
+                return ver
+        except Exception:
+            continue
+    return None
+
+
+def install_repo_update() -> None:
+    raw = b""
+    last_err: Exception | None = None
+    for url in GITHUB_ZIP_URLS:
+        try:
+            raw = _http_get(url, 60)
+            if raw[:2] == b"PK":
+                break
+        except Exception as exc:
+            last_err = exc
+            raw = b""
+    if not raw:
+        raise RuntimeError(last_err or "telechargement GitHub impossible")
+
+    staging = Path(tempfile.mkdtemp(prefix="eclatplus-upd-"))
+    zpath = staging / "repo.zip"
+    zpath.write_bytes(raw)
+    extracted = staging / "extracted"
+    extracted.mkdir()
+    with zipfile.ZipFile(zpath) as zf:
+        zf.extractall(extracted)
+    kids = [p for p in extracted.iterdir() if p.is_dir()]
+    root = kids[0] if len(kids) == 1 else extracted
+    dest = Path(__file__).resolve().parent
+    for name in UPDATE_FILES:
+        src = root / name
+        if src.is_file():
+            (dest / name).write_bytes(src.read_bytes())
+
+    launcher = dest / "lancer.bat"
+    if not (dest / "eclatplus.py").is_file() or not launcher.is_file():
+        raise RuntimeError("fichiers manquants apres copie")
+
+    bat = Path(tempfile.gettempdir()) / "eclatplus-apply-update.bat"
+    pid = os.getpid()
+    bat.write_text(
+        "\n".join(
+            [
+                "@echo off",
+                f":wait{pid}",
+                f'tasklist /FI "PID eq {pid}" | find "{pid}" >nul',
+                f"if not errorlevel 1 (timeout /t 1 /nobreak >nul & goto wait{pid})",
+                f'start "" "{launcher}"',
+                f'rd /s /q "{staging}"',
+                'del "%~f0"',
+                "",
+            ]
+        ),
+        encoding="ascii",
+        errors="replace",
+    )
+    os.startfile(str(bat))
 
 
 def _clamp(n: int, lo: int, hi: int) -> int:
@@ -517,17 +624,16 @@ class App(tk.Tk):
         self.title("EclatPlus")
         self.resizable(False, False)
         self.cfg = load_settings()
-        self._dirty = False
         self._applied = None
 
         frm = tk.Frame(self, padx=10, pady=10)
         frm.pack()
 
         tk.Label(frm, text="ECLAT (0-200)").grid(row=0, column=0, sticky="w")
-        self.var = tk.IntVar(value=self.cfg["eclat"])
         self.lbl = tk.Label(frm, text=str(self.cfg["eclat"]), width=5)
         self.lbl.grid(row=0, column=1, sticky="e")
 
+        self.var = tk.IntVar(value=self.cfg["eclat"])
         self.scale = tk.Scale(
             frm,
             from_=0,
@@ -569,12 +675,56 @@ class App(tk.Tk):
         self._apply_now()
         if start_tray:
             self.iconify()
+        threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _update_worker(self) -> None:
+        try:
+            remote = remote_version()
+            if not remote:
+                return
+            if _parse_version(remote) <= _parse_version(LOCAL_VERSION):
+                return
+            self.after(0, lambda: self._ask_update(remote))
+        except Exception:
+            return
+
+    def _ask_update(self, remote: str) -> None:
+        if not self.winfo_exists():
+            return
+        self.deiconify()
+        self.lift()
+        ok = messagebox.askyesno(
+            "EclatPlus",
+            f"Nouvelle version sur GitHub : {remote}\n"
+            f"Version actuelle : {LOCAL_VERSION}\n\n"
+            "Installer depuis le depot (pas les Releases) ?\n"
+            "Tes reglages ne sont pas modifies.",
+            parent=self,
+        )
+        if not ok:
+            return
+        try:
+            self.config(cursor="watch")
+            self.update_idletasks()
+            self._mark()
+            save_settings(self.cfg)
+            install_repo_update()
+            restore_all()
+            shutdown_all()
+            self.destroy()
+        except Exception as exc:
+            self.config(cursor="")
+            messagebox.showerror(
+                "EclatPlus",
+                f"Mise a jour impossible :\n{exc}\n\nOuverture de GitHub.",
+                parent=self,
+            )
+            os.startfile(GITHUB_PAGE)
 
     def _mark(self) -> None:
         self.cfg["eclat"] = int(self.var.get())
         self.cfg["limiter"] = bool(self.limiter.get())
         self.cfg["startup"] = bool(self.startup.get())
-        self._dirty = True
 
     def _on_scale(self, _raw: str) -> None:
         self.lbl.config(text=str(int(self.var.get())))
@@ -584,14 +734,12 @@ class App(tk.Tk):
     def _on_limiter(self) -> None:
         self._mark()
         save_settings(self.cfg)
-        self._dirty = False
         self._apply_now()
 
     def _on_startup(self) -> None:
         self._mark()
         set_startup(bool(self.startup.get()))
         save_settings(self.cfg)
-        self._dirty = False
 
     def _apply_now(self) -> None:
         value = int(self.var.get())
