@@ -1,0 +1,659 @@
+"""EclatPlus — éclat des couleurs, Python stdlib, inactif hors changement."""
+from __future__ import annotations
+
+import atexit
+import ctypes
+import json
+import sys
+import tkinter as tk
+from ctypes import wintypes
+from pathlib import Path
+
+APP_NAME = "EclatPlus"
+
+
+def settings_path() -> Path:
+    root = Path.home() / "AppData" / "Roaming" / APP_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "settings.json"
+
+
+def load_settings() -> dict:
+    defaults = {"eclat": 50, "limiter": False, "startup": False}
+    path = settings_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            defaults.update(data)
+    except (OSError, json.JSONDecodeError):
+        pass
+    defaults["eclat"] = max(0, min(200, int(defaults.get("eclat") or 50)))
+    defaults["limiter"] = bool(defaults.get("limiter"))
+    defaults["startup"] = bool(defaults.get("startup"))
+    return defaults
+
+
+def save_settings(data: dict) -> None:
+    payload = {
+        "eclat": int(data["eclat"]),
+        "limiter": bool(data["limiter"]),
+        "startup": bool(data["startup"]),
+    }
+    settings_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def exe_command() -> str:
+    if getattr(sys, "frozen", False):
+        path = sys.executable
+    else:
+        path = str(Path(__file__).resolve())
+        return f'"{sys.executable}" "{path}" --tray'
+    return f'"{path}" --tray'
+
+
+def set_startup(enabled: bool) -> None:
+    import winreg
+
+    key = winreg.CreateKey(
+        winreg.HKEY_CURRENT_USER,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+    )
+    try:
+        if enabled:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, exe_command())
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
+    finally:
+        key.Close()
+
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    return lo if n < lo else hi if n > hi else n
+
+
+def _map_percent(percent: int, min_l: int, def_l: int, max_l: int) -> int:
+    percent = _clamp(percent, 0, 100)
+    if percent <= 50:
+        t = percent / 50.0
+        return int(round(min_l + (def_l - min_l) * t))
+    u = (percent - 50) / 50.0
+    return int(round(def_l + (max_l - def_l) * u))
+
+
+def _level_to_percent(level: int, min_l: int, def_l: int, max_l: int) -> int:
+    if level <= def_l:
+        span = def_l - min_l
+        if span <= 0:
+            return 50
+        return int(round(50.0 * (level - min_l) / span))
+    span = max_l - def_l
+    if span <= 0:
+        return 50
+    return 50 + int(round(50.0 * (level - def_l) / span))
+
+
+class DvcInfo(ctypes.Structure):
+    _fields_ = [
+        ("Version", ctypes.c_uint32),
+        ("CurrentLevel", ctypes.c_int32),
+        ("MinLevel", ctypes.c_int32),
+        ("MaxLevel", ctypes.c_int32),
+    ]
+
+
+class DvcInfoEx(ctypes.Structure):
+    _fields_ = [
+        ("Version", ctypes.c_uint32),
+        ("CurrentLevel", ctypes.c_int32),
+        ("MinLevel", ctypes.c_int32),
+        ("MaxLevel", ctypes.c_int32),
+        ("DefaultLevel", ctypes.c_int32),
+    ]
+
+
+def _nv_ver(size: int) -> int:
+    return size | 0x10000
+
+
+class NvidiaBackend:
+    ID_INIT = 0x0150E828
+    ID_UNLOAD = 0xD22BDD7E
+    ID_ENUM = 0x9ABDD40D
+    ID_GET = 0x4085DE45
+    ID_GET_EX = 0x0E45002D
+    ID_SET = 0x172409B4
+    ID_SET_EX = 0x4A82C2B1
+    OK = 0
+    END = -7
+
+    def __init__(self) -> None:
+        self.dll = ctypes.WinDLL("nvapi64.dll")
+        self.query = self.dll.nvapi_QueryInterface
+        self.query.restype = ctypes.c_void_p
+        self.query.argtypes = [ctypes.c_uint32]
+
+        init = self._fn(self.ID_INIT, ctypes.CFUNCTYPE(ctypes.c_int))
+        if init() != self.OK:
+            raise OSError("NvAPI_Initialize")
+
+        self.unload = self._fn(self.ID_UNLOAD, ctypes.CFUNCTYPE(ctypes.c_int), optional=True)
+        self.enum_display = self._fn(
+            self.ID_ENUM,
+            ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)),
+        )
+        self.get_ex = self._fn(
+            self.ID_GET_EX,
+            ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DvcInfoEx)),
+            optional=True,
+        )
+        self.set_ex = self._fn(
+            self.ID_SET_EX,
+            ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DvcInfoEx)),
+            optional=True,
+        )
+        self.get = self._fn(
+            self.ID_GET,
+            ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(DvcInfo)),
+            optional=True,
+        )
+        self.set = self._fn(
+            self.ID_SET,
+            ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int),
+            optional=True,
+        )
+        self.use_ex = bool(self.get_ex and self.set_ex)
+        if not self.enum_display or (not self.use_ex and not (self.get and self.set)):
+            raise OSError("NvAPI DVC")
+
+        self.targets: list[dict] = []
+        for i in range(64):
+            display = ctypes.c_void_p()
+            status = self.enum_display(i, ctypes.byref(display))
+            if status == self.END or not display.value:
+                break
+            if status != self.OK:
+                continue
+            handle = ctypes.c_void_p(display.value)
+            info = self._read(handle)
+            if info is None:
+                continue
+            min_l, def_l, max_l, cur = info
+            self.targets.append(
+                {
+                    "display": handle,
+                    "original": cur,
+                    "min": min_l,
+                    "def": def_l,
+                    "max": max_l,
+                }
+            )
+        if not self.targets:
+            raise OSError("Aucun écran NVIDIA DVC")
+
+    def _fn(self, ident: int, proto, optional: bool = False):
+        ptr = self.query(ident)
+        if not ptr:
+            if optional:
+                return None
+            raise OSError(hex(ident))
+        return proto(ptr)
+
+    def _read(self, display: ctypes.c_void_p):
+        if self.use_ex and self.get_ex:
+            info = DvcInfoEx()
+            info.Version = _nv_ver(ctypes.sizeof(DvcInfoEx))
+            if self.get_ex(display, 0, ctypes.byref(info)) == self.OK:
+                return info.MinLevel, info.DefaultLevel, info.MaxLevel, info.CurrentLevel
+        if self.get:
+            info = DvcInfo()
+            info.Version = _nv_ver(ctypes.sizeof(DvcInfo))
+            if self.get(display, 0, ctypes.byref(info)) == self.OK:
+                return info.MinLevel, info.MinLevel, info.MaxLevel, info.CurrentLevel
+        return None
+
+    def _set_level(self, display: ctypes.c_void_p, level: int) -> bool:
+        if self.use_ex and self.set_ex and self.get_ex:
+            info = DvcInfoEx()
+            info.Version = _nv_ver(ctypes.sizeof(DvcInfoEx))
+            if self.get_ex(display, 0, ctypes.byref(info)) != self.OK:
+                return False
+            info.CurrentLevel = _clamp(level, info.MinLevel, info.MaxLevel)
+            return self.set_ex(display, 0, ctypes.byref(info)) == self.OK
+        if self.set:
+            return self.set(display, 0, level) == self.OK
+        return False
+
+    @property
+    def name(self) -> str:
+        return "NVIDIA Éclat numérique"
+
+    def apply_percent(self, percent: int) -> bool:
+        ok = False
+        for t in self.targets:
+            level = _map_percent(percent, t["min"], t["def"], t["max"])
+            if self._set_level(t["display"], level):
+                ok = True
+        return ok
+
+    def restore(self) -> None:
+        for t in self.targets:
+            self._set_level(t["display"], t["original"])
+
+    def original_percent(self) -> int:
+        t = self.targets[0]
+        return _level_to_percent(t["original"], t["min"], t["def"], t["max"])
+
+    def close(self) -> None:
+        self.restore()
+        if self.unload:
+            self.unload()
+
+
+class AmdBackend:
+    OK = 0
+    SAT = 1 << 2
+
+    def __init__(self) -> None:
+        self.dll = ctypes.WinDLL("atiadlxx.dll")
+        alloc_t = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
+        self._bufs: list = []
+
+        def alloc(n: int) -> int:
+            buf = ctypes.create_string_buffer(n)
+            self._bufs.append(buf)
+            return ctypes.addressof(buf)
+
+        self._alloc = alloc_t(alloc)
+        self.dll.ADL2_Main_Control_Create.restype = ctypes.c_int
+        self.dll.ADL2_Main_Control_Create.argtypes = [alloc_t, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+        self.dll.ADL2_Main_Control_Destroy.argtypes = [ctypes.c_void_p]
+        self.dll.ADL2_Display_Color_Get.restype = ctypes.c_int
+        self.dll.ADL2_Display_Color_Get.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self.dll.ADL2_Display_Color_Set.restype = ctypes.c_int
+        self.dll.ADL2_Display_Color_Set.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        ctx = ctypes.c_void_p()
+        if self.dll.ADL2_Main_Control_Create(self._alloc, 1, ctypes.byref(ctx)) != self.OK or not ctx.value:
+            raise OSError("ADL2_Main_Control_Create")
+        self.ctx = ctx
+        self.targets: list[dict] = []
+        for adapter in range(16):
+            for display in range(8):
+                cur = ctypes.c_int()
+                defv = ctypes.c_int()
+                min_l = ctypes.c_int()
+                max_l = ctypes.c_int()
+                step = ctypes.c_int()
+                if (
+                    self.dll.ADL2_Display_Color_Get(
+                        self.ctx,
+                        adapter,
+                        display,
+                        self.SAT,
+                        ctypes.byref(cur),
+                        ctypes.byref(defv),
+                        ctypes.byref(min_l),
+                        ctypes.byref(max_l),
+                        ctypes.byref(step),
+                    )
+                    != self.OK
+                ):
+                    continue
+                self.targets.append(
+                    {
+                        "adapter": adapter,
+                        "display": display,
+                        "original": cur.value,
+                        "min": min_l.value,
+                        "def": defv.value,
+                        "max": max_l.value,
+                    }
+                )
+        if not self.targets:
+            self.dll.ADL2_Main_Control_Destroy(self.ctx)
+            raise OSError("Aucun écran AMD saturation")
+
+    @property
+    def name(self) -> str:
+        return "AMD Saturation"
+
+    def apply_percent(self, percent: int) -> bool:
+        ok = False
+        for t in self.targets:
+            level = _map_percent(percent, t["min"], t["def"], t["max"])
+            if self.dll.ADL2_Display_Color_Set(self.ctx, t["adapter"], t["display"], self.SAT, level) == self.OK:
+                ok = True
+        return ok
+
+    def restore(self) -> None:
+        for t in self.targets:
+            self.dll.ADL2_Display_Color_Set(self.ctx, t["adapter"], t["display"], self.SAT, t["original"])
+
+    def original_percent(self) -> int:
+        t = self.targets[0]
+        return _level_to_percent(t["original"], t["min"], t["def"], t["max"])
+
+    def close(self) -> None:
+        self.restore()
+        self.dll.ADL2_Main_Control_Destroy(self.ctx)
+
+
+class Gpu:
+    def __init__(self) -> None:
+        self.backend = None
+        self._last = -1
+        try:
+            self.backend = NvidiaBackend()
+        except OSError:
+            try:
+                self.backend = AmdBackend()
+            except OSError:
+                self.backend = None
+
+    @property
+    def name(self) -> str:
+        return self.backend.name if self.backend else "Aucun pilote NVIDIA/AMD"
+
+    def apply_percent(self, percent: int) -> bool:
+        if not self.backend:
+            return False
+        percent = _clamp(percent, 0, 100)
+        if percent == self._last:
+            return True
+        ok = self.backend.apply_percent(percent)
+        if ok:
+            self._last = percent
+        return ok
+
+    def restore(self) -> None:
+        self._last = -1
+        if self.backend:
+            self.backend.restore()
+
+    def original_percent(self) -> int:
+        return self.backend.original_percent() if self.backend else 50
+
+    def close(self) -> None:
+        self._last = -1
+        if self.backend:
+            self.backend.close()
+            self.backend = None
+
+
+class MagColorEffect(ctypes.Structure):
+    _fields_ = [("transform", ctypes.c_float * 25)]
+
+
+class Magnification:
+    def __init__(self) -> None:
+        self._dll = None
+        self._on = False
+        self._last = 0.0
+
+    def _load(self) -> bool:
+        if self._dll:
+            return True
+        try:
+            dll = ctypes.WinDLL("Magnification.dll")
+        except OSError:
+            return False
+        dll.MagInitialize.restype = wintypes.BOOL
+        dll.MagUninitialize.restype = wintypes.BOOL
+        dll.MagSetFullscreenColorEffect.restype = wintypes.BOOL
+        dll.MagSetFullscreenColorEffect.argtypes = [ctypes.POINTER(MagColorEffect)]
+        try:
+            dll.MagSetFullscreenUseBitmapSmoothing.argtypes = [wintypes.BOOL]
+            dll.MagSetFullscreenUseBitmapSmoothing.restype = wintypes.BOOL
+        except AttributeError:
+            pass
+        self._dll = dll
+        return True
+
+    def shutdown(self) -> None:
+        if not self._on:
+            self._last = 0.0
+            return
+        try:
+            self._dll.MagUninitialize()
+        except Exception:
+            pass
+        self._on = False
+        self._last = 0.0
+
+    def apply_amount(self, amount: float) -> bool:
+        if amount <= 1.001:
+            self.shutdown()
+            return True
+        if self._on and abs(amount - self._last) < 0.0005:
+            return True
+        if not self._load():
+            return False
+        if not self._on:
+            if not self._dll.MagInitialize():
+                return False
+            smooth = getattr(self._dll, "MagSetFullscreenUseBitmapSmoothing", None)
+            if smooth:
+                smooth(False)
+            self._on = True
+            self._last = 0.0
+        inv = 1.0 - amount
+        g = (1.0 / 3.0) * inv
+        d = g + amount
+        m = MagColorEffect()
+        vals = [0.0] * 25
+        vals[0], vals[1], vals[2] = d, g, g
+        vals[5], vals[6], vals[7] = g, d, g
+        vals[10], vals[11], vals[12] = g, g, d
+        vals[18] = 1.0
+        vals[24] = 1.0
+        for i, v in enumerate(vals):
+            m.transform[i] = v
+        if not self._dll.MagSetFullscreenColorEffect(ctypes.byref(m)):
+            self.shutdown()
+            return False
+        self._last = amount
+        return True
+
+
+GPU = Gpu()
+MAG = Magnification()
+_closed = False
+
+
+def apply_eclat(value: int, limiter: bool) -> str:
+    value = _clamp(int(value), 0, 200)
+    if limiter:
+        value = min(value, 100)
+    GPU.apply_percent(_clamp(value, 0, 100))
+    if (not limiter) and value > 100:
+        t = (value - 100) / 100.0
+        amount = 1.0 + t * 2.0
+        MAG.apply_amount(amount)
+        extra = "couche extra ON"
+    else:
+        MAG.shutdown()
+        extra = "couche extra OFF"
+    return f"{GPU.name} | driver {min(value, 100)} | {extra}"
+
+
+def restore_all() -> None:
+    MAG.shutdown()
+    GPU.restore()
+
+
+def shutdown_all() -> None:
+    global _closed
+    if _closed:
+        return
+    _closed = True
+    MAG.shutdown()
+    GPU.close()
+
+
+atexit.register(shutdown_all)
+
+
+class App(tk.Tk):
+    def __init__(self, start_tray: bool) -> None:
+        super().__init__()
+        self.title("EclatPlus")
+        self.resizable(False, False)
+        self.cfg = load_settings()
+        self._dirty = False
+        self._applied = None
+
+        frm = tk.Frame(self, padx=10, pady=10)
+        frm.pack()
+
+        tk.Label(frm, text="ECLAT (0-200)").grid(row=0, column=0, sticky="w")
+        self.var = tk.IntVar(value=self.cfg["eclat"])
+        self.lbl = tk.Label(frm, text=str(self.cfg["eclat"]), width=5)
+        self.lbl.grid(row=0, column=1, sticky="e")
+
+        self.scale = tk.Scale(
+            frm,
+            from_=0,
+            to=200,
+            orient="horizontal",
+            length=280,
+            showvalue=False,
+            variable=self.var,
+            command=self._on_scale,
+        )
+        self.scale.grid(row=1, column=0, columnspan=2, pady=4)
+
+        self.limiter = tk.BooleanVar(value=self.cfg["limiter"])
+        tk.Checkbutton(
+            frm,
+            text="Limiter au pilote (max 100, pas de Loupe)",
+            variable=self.limiter,
+            command=self._on_limiter,
+        ).grid(row=2, column=0, columnspan=2, sticky="w")
+
+        self.startup = tk.BooleanVar(value=self.cfg["startup"])
+        tk.Checkbutton(
+            frm,
+            text="Demarrer avec Windows",
+            variable=self.startup,
+            command=self._on_startup,
+        ).grid(row=3, column=0, columnspan=2, sticky="w")
+
+        btns = tk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=2, pady=8, sticky="ew")
+        tk.Button(btns, text="Appliquer", command=self._apply_now).pack(side="left", expand=True, fill="x")
+        tk.Button(btns, text="Restaurer", command=self._restore).pack(side="left", expand=True, fill="x", padx=6)
+        tk.Button(btns, text="Quitter", command=self._quit_restore).pack(side="left", expand=True, fill="x")
+
+        self.status = tk.Label(frm, text=GPU.name, wraplength=320, justify="left")
+        self.status.grid(row=5, column=0, columnspan=2, sticky="w")
+
+        self.protocol("WM_DELETE_WINDOW", self._quit_restore)
+        self._apply_now()
+        if start_tray:
+            self.iconify()
+
+    def _mark(self) -> None:
+        self.cfg["eclat"] = int(self.var.get())
+        self.cfg["limiter"] = bool(self.limiter.get())
+        self.cfg["startup"] = bool(self.startup.get())
+        self._dirty = True
+
+    def _on_scale(self, _raw: str) -> None:
+        self.lbl.config(text=str(int(self.var.get())))
+        self._mark()
+        self._apply_now()
+
+    def _on_limiter(self) -> None:
+        self._mark()
+        save_settings(self.cfg)
+        self._dirty = False
+        self._apply_now()
+
+    def _on_startup(self) -> None:
+        self._mark()
+        set_startup(bool(self.startup.get()))
+        save_settings(self.cfg)
+        self._dirty = False
+
+    def _apply_now(self) -> None:
+        value = int(self.var.get())
+        limiter = bool(self.limiter.get())
+        key = (value, limiter)
+        if key == self._applied:
+            return
+        self.status.config(text=apply_eclat(value, limiter))
+        self._applied = key
+        self._mark()
+
+    def _restore(self) -> None:
+        restore_all()
+        orig = GPU.original_percent()
+        self.var.set(orig)
+        self.lbl.config(text=str(orig))
+        MAG.shutdown()
+        self._applied = (orig, bool(self.limiter.get()))
+        self._mark()
+        self.status.config(text=f"Restaure au niveau d'origine ({orig}). {GPU.name}")
+
+    def _quit_restore(self) -> None:
+        self._mark()
+        save_settings(self.cfg)
+        restore_all()
+        shutdown_all()
+        self.destroy()
+
+
+def selftest() -> int:
+    lines = [f"backend={GPU.name}"]
+    try:
+        lines.append(f"apply50={GPU.apply_percent(50)}")
+        lines.append(f"apply100={GPU.apply_percent(100)}")
+        restore_all()
+        lines.append("restore=ok")
+        mag_ok = MAG.apply_amount(1.0)
+        MAG.shutdown()
+        lines.append(f"mag_identity_off={mag_ok and not MAG._on}")
+        limiter_status = apply_eclat(150, True)
+        mag_was = MAG._on
+        MAG.shutdown()
+        GPU.restore()
+        lines.append(f"limiter150 mag_active={mag_was} status={limiter_status}")
+        print("\n".join(lines))
+        return 0
+    except Exception as ex:
+        print("\n".join(lines))
+        print("FAIL", ex)
+        restore_all()
+        return 1
+    finally:
+        shutdown_all()
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if "--selftest" in args:
+        return selftest()
+    App(start_tray="--tray" in args).mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
