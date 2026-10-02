@@ -13,7 +13,9 @@ import urllib.request
 import zipfile
 from ctypes import wintypes
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import colorchooser, messagebox
+
+from crosshair import CrosshairOverlay
 
 APP_NAME = "EclatPlus"
 LOCAL_VERSION = "1.2.0"
@@ -28,6 +30,7 @@ GITHUB_ZIP_URLS = (
 )
 UPDATE_FILES = (
     "eclatplus.py",
+    "crosshair.py",
     "lancer.bat",
     "build_exe.bat",
     "README.md",
@@ -44,7 +47,19 @@ def settings_path() -> Path:
 
 
 def load_settings() -> dict:
-    defaults = {"eclat": 50, "limiter": False, "startup": False}
+    defaults = {
+        "eclat": 50,
+        "limiter": False,
+        "startup": False,
+        "crosshair": False,
+        "ch_style": "cross",
+        "ch_color": "#00FF00",
+        "ch_size": 8,
+        "ch_thick": 2,
+        "ch_gap": 4,
+        "ch_outline": True,
+        "ch_opacity": 100,
+    }
     path = settings_path()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -55,6 +70,29 @@ def load_settings() -> dict:
     defaults["eclat"] = max(0, min(200, int(defaults.get("eclat") or 50)))
     defaults["limiter"] = bool(defaults.get("limiter"))
     defaults["startup"] = bool(defaults.get("startup"))
+    if defaults.get("ch_style") not in ("cross", "dot", "circle", "crossdot"):
+        defaults["ch_style"] = "cross"
+    defaults["crosshair"] = bool(defaults.get("crosshair"))
+    defaults["ch_outline"] = bool(defaults.get("ch_outline"))
+    color = str(defaults.get("ch_color") or "#00FF00").strip()
+    if len(color) != 7 or not color.startswith("#"):
+        color = "#00FF00"
+    else:
+        try:
+            int(color[1:], 16)
+        except ValueError:
+            color = "#00FF00"
+    defaults["ch_color"] = color.upper()
+    for key, default, lo, hi in (
+        ("ch_size", 8, 1, 40),
+        ("ch_thick", 2, 1, 10),
+        ("ch_gap", 4, 0, 40),
+        ("ch_opacity", 100, 1, 100),
+    ):
+        try:
+            defaults[key] = _clamp(int(defaults.get(key, default)), lo, hi)
+        except (TypeError, ValueError):
+            defaults[key] = default
     return defaults
 
 
@@ -63,6 +101,14 @@ def save_settings(data: dict) -> None:
         "eclat": int(data["eclat"]),
         "limiter": bool(data["limiter"]),
         "startup": bool(data["startup"]),
+        "crosshair": bool(data.get("crosshair")),
+        "ch_style": str(data.get("ch_style") or "cross"),
+        "ch_color": str(data.get("ch_color") or "#00FF00"),
+        "ch_size": int(data.get("ch_size", 8)),
+        "ch_thick": int(data.get("ch_thick", 2)),
+        "ch_gap": int(data.get("ch_gap", 4)),
+        "ch_outline": bool(data.get("ch_outline", True)),
+        "ch_opacity": int(data.get("ch_opacity", 100)),
     }
     settings_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -582,6 +628,7 @@ class Magnification:
 
 GPU = Gpu()
 MAG = Magnification()
+CROSSHAIR = CrosshairOverlay()
 _closed = False
 
 
@@ -611,6 +658,10 @@ def shutdown_all() -> None:
     if _closed:
         return
     _closed = True
+    try:
+        CROSSHAIR.shutdown()
+    except Exception:
+        pass
     MAG.shutdown()
     GPU.close()
 
@@ -669,13 +720,141 @@ class App(tk.Tk):
         tk.Button(btns, text="Quitter", command=self._quit_restore).pack(side="left", expand=True, fill="x")
 
         self.status = tk.Label(frm, text=GPU.name, wraplength=320, justify="left")
-        self.status.grid(row=5, column=0, columnspan=2, sticky="w")
+        self.status.grid(row=12, column=0, columnspan=2, sticky="w")
+
+        self._build_crosshair(frm)
 
         self.protocol("WM_DELETE_WINDOW", self._quit_restore)
+        self._ch_armed = False
         self._apply_now()
+        self._sync_crosshair()
         if start_tray:
             self.iconify()
         threading.Thread(target=self._update_worker, daemon=True).start()
+
+    def _build_crosshair(self, frm: tk.Frame) -> None:
+        styles = {"Croix": "cross", "Point": "dot", "Cercle": "circle", "Croix + point": "crossdot"}
+        self._style_to_code = styles
+        self._code_to_style = {code: label for label, code in styles.items()}
+        self._ch_color = self.cfg["ch_color"]
+
+        tk.Label(frm, text="VISEUR").grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        flags = tk.Frame(frm)
+        flags.grid(row=6, column=0, columnspan=2, sticky="w")
+        self.ch_on = tk.BooleanVar(value=self.cfg["crosshair"])
+        tk.Checkbutton(flags, text="Afficher", variable=self.ch_on, command=lambda: self._sync_crosshair(True)).pack(side="left")
+        self.ch_outline = tk.BooleanVar(value=self.cfg["ch_outline"])
+        tk.Checkbutton(flags, text="Contour", variable=self.ch_outline, command=lambda: self._sync_crosshair(True)).pack(side="left", padx=8)
+
+        form = tk.Frame(frm)
+        form.grid(row=7, column=0, columnspan=2, sticky="w", pady=2)
+        tk.Label(form, text="Forme").pack(side="left")
+        self.ch_style = tk.StringVar(value=self._code_to_style.get(self.cfg["ch_style"], "Croix"))
+        menu = tk.OptionMenu(form, self.ch_style, *styles.keys(), command=lambda _v: self._sync_crosshair(True))
+        menu.config(width=14)
+        menu.pack(side="left", padx=6)
+
+        colors = tk.Frame(frm)
+        colors.grid(row=8, column=0, columnspan=2, sticky="w")
+        for hex_color in ("#00FF00", "#FF0000", "#00FFFF", "#FFFF00", "#FFFFFF", "#FF00FF"):
+            tk.Button(
+                colors,
+                width=2,
+                bg=hex_color,
+                activebackground=hex_color,
+                command=lambda h=hex_color: self._set_ch_color(h),
+            ).pack(side="left", padx=1)
+        self._color_btn = tk.Button(colors, text="Autre", command=self._pick_ch_color)
+        self._color_btn.pack(side="left", padx=6)
+        self._paint_color_btn()
+
+        self.ch_size = tk.IntVar(value=self.cfg["ch_size"])
+        self.ch_thick = tk.IntVar(value=self.cfg["ch_thick"])
+        self.ch_gap = tk.IntVar(value=self.cfg["ch_gap"])
+        self.ch_opacity = tk.IntVar(value=self.cfg["ch_opacity"])
+        self._ch_scale(frm, 9, 0, "Taille", self.ch_size, 1, 40)
+        self._ch_scale(frm, 9, 1, "Epaisseur", self.ch_thick, 1, 10)
+        self._ch_scale(frm, 10, 0, "Ecart", self.ch_gap, 0, 40)
+        self._ch_scale(frm, 10, 1, "Opacite", self.ch_opacity, 1, 100)
+
+        self.ch_hint = tk.Label(
+            frm,
+            text="Visible en fenetre et en borderless. Plein ecran total : Windows le cache.",
+            wraplength=300,
+            justify="left",
+            fg="#555555",
+        )
+        self.ch_hint.grid(row=11, column=0, columnspan=2, sticky="w", pady=(2, 6))
+
+    def _ch_scale(self, frm: tk.Frame, row: int, col: int, label: str, var: tk.IntVar, lo: int, hi: int) -> None:
+        tk.Scale(
+            frm,
+            from_=lo,
+            to=hi,
+            orient="horizontal",
+            length=145,
+            resolution=1,
+            label=label,
+            variable=var,
+            command=self._on_ch_scale,
+        ).grid(row=row, column=col, sticky="w")
+
+    def _paint_color_btn(self) -> None:
+        color = self._ch_color
+        r = int(color[1:3], 16)
+        g = int(color[3:5], 16)
+        b = int(color[5:7], 16)
+        fg = "#000000" if (r * 299 + g * 587 + b * 114) > 140000 else "#FFFFFF"
+        self._color_btn.config(bg=color, fg=fg, activebackground=color, activeforeground=fg)
+
+    def _set_ch_color(self, color: str) -> None:
+        self._ch_color = color.upper()
+        self._paint_color_btn()
+        self._sync_crosshair(True)
+
+    def _pick_ch_color(self) -> None:
+        chosen = colorchooser.askcolor(color=self._ch_color, parent=self)
+        if chosen and chosen[1]:
+            self._set_ch_color(str(chosen[1]))
+
+    def _on_ch_scale(self, _raw: str) -> None:
+        self._sync_crosshair(False)
+
+    def _sync_crosshair(self, save: bool = False) -> None:
+        self._mark()
+        if save:
+            save_settings(self.cfg)
+        try:
+            host = int(self.winfo_id())
+        except tk.TclError:
+            host = 0
+        try:
+            CROSSHAIR.apply(self.cfg, host)
+        except Exception:
+            self.ch_hint.config(text="Viseur indisponible")
+        else:
+            self.ch_hint.config(text="Visible en fenetre et en borderless. Plein ecran total : Windows le cache.")
+            self._arm_crosshair_tick()
+
+    def _arm_crosshair_tick(self) -> None:
+        if self._ch_armed or not bool(self.ch_on.get()):
+            return
+        self._ch_armed = True
+        self.after(250, self._crosshair_tick)
+
+    def _crosshair_tick(self) -> None:
+        if not self.winfo_exists():
+            self._ch_armed = False
+            return
+        if not bool(self.ch_on.get()):
+            self._ch_armed = False
+            return
+        try:
+            CROSSHAIR.tick()
+        except Exception:
+            pass
+        self.after(250, self._crosshair_tick)
 
     def _update_worker(self) -> None:
         try:
@@ -725,6 +904,15 @@ class App(tk.Tk):
         self.cfg["eclat"] = int(self.var.get())
         self.cfg["limiter"] = bool(self.limiter.get())
         self.cfg["startup"] = bool(self.startup.get())
+        if hasattr(self, "ch_on"):
+            self.cfg["crosshair"] = bool(self.ch_on.get())
+            self.cfg["ch_outline"] = bool(self.ch_outline.get())
+            self.cfg["ch_style"] = self._style_to_code.get(self.ch_style.get(), "cross")
+            self.cfg["ch_color"] = self._ch_color
+            self.cfg["ch_size"] = int(self.ch_size.get())
+            self.cfg["ch_thick"] = int(self.ch_thick.get())
+            self.cfg["ch_gap"] = int(self.ch_gap.get())
+            self.cfg["ch_opacity"] = int(self.ch_opacity.get())
 
     def _on_scale(self, _raw: str) -> None:
         self.lbl.config(text=str(int(self.var.get())))
